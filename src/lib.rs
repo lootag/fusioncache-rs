@@ -1,6 +1,9 @@
+use failsafe::{FailSafeCache, FailSafeConfiguration, FailSafeResult};
 use moka::future::Cache;
 use std::{collections::HashMap, hash::Hash, marker::PhantomData, sync::Arc};
 use tokio::sync::{Mutex, broadcast};
+
+mod failsafe;
 
 pub trait Factory<
     TKey: Clone + Send + Sync + 'static,
@@ -44,11 +47,17 @@ impl<
         self
     }
 
-    pub fn with_fail_safe(mut self, entry_ttl: u64, failsafe_ttl: u64) -> Self {
-        self.fail_safe_configuration = Some(FailSafeConfiguration {
+    pub fn with_fail_safe(
+        mut self,
+        entry_ttl: std::time::Duration,
+        failsafe_ttl: std::time::Duration,
+        max_cycles: Option<u64>,
+    ) -> Self {
+        self.fail_safe_configuration = Some(FailSafeConfiguration::new(
             entry_ttl,
             failsafe_ttl,
-        });
+            max_cycles,
+        ));
         self
     }
 
@@ -58,19 +67,19 @@ impl<
     ) -> FusionCache<TKey, TValue, TError, F> {
         FusionCache {
             cache: Cache::new(self.capacity),
-            fail_safe_configuration: self.fail_safe_configuration,
-            fail_safe_cache: Cache::new(self.capacity),
+            fail_safe_cache: self.fail_safe_configuration.map(|c| FailSafeCache::new(c)),
             factory,
-            bookkeeper: Arc::new(Mutex::new(HashMap::new())),
+            in_flight_factory_requests: Arc::new(Mutex::new(HashMap::new())),
             phantom_t_error: PhantomData,
         }
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum FusionCacheError {
     Other,
     SystemCorruption,
+    FactoryError,
 }
 
 #[derive(Clone)]
@@ -81,10 +90,10 @@ pub struct FusionCache<
     F: Factory<TKey, TValue, TError>,
 > {
     cache: Cache<TKey, TValue>,
-    fail_safe_configuration: Option<FailSafeConfiguration>,
-    fail_safe_cache: Cache<TKey, TValue>,
+    fail_safe_cache: Option<FailSafeCache<TKey, TValue>>,
     factory: F,
-    bookkeeper: Arc<Mutex<HashMap<TKey, broadcast::Sender<TValue>>>>,
+    in_flight_factory_requests:
+        Arc<Mutex<HashMap<TKey, broadcast::Sender<Result<TValue, FusionCacheError>>>>>,
     phantom_t_error: PhantomData<TError>,
 }
 
@@ -95,25 +104,25 @@ impl<
     F: Factory<TKey, TValue, TError>,
 > FusionCache<TKey, TValue, TError, F>
 {
-    pub async fn get_or_set(&self, key: TKey) -> Result<TValue, FusionCacheError> {
-        let mut bookkeeper = self.bookkeeper.lock().await;
-        let sender = bookkeeper.get(&key).cloned();
+    pub async fn get_or_set(&mut self, key: TKey) -> Result<TValue, FusionCacheError> {
+        let mut in_flight_factory_requests = self.in_flight_factory_requests.lock().await;
+        let sender = in_flight_factory_requests.get(&key).cloned();
         let maybe_entry = self.cache.get(&key).await;
         match maybe_entry {
             Some(entry) => {
                 if let Some(_) = sender {
-                    bookkeeper.remove(&key);
+                    in_flight_factory_requests.remove(&key);
                 }
-                drop(bookkeeper);
+                drop(in_flight_factory_requests);
                 Ok(entry)
             }
             None => match sender {
                 Some(sender) => {
-                    drop(bookkeeper);
+                    drop(in_flight_factory_requests);
                     let mut receiver = sender.subscribe();
                     let value = receiver.recv().await;
                     if let Ok(value) = value {
-                        Ok(value)
+                        value.map_err(|e| e.into())
                     } else {
                         let maybe_value = self.cache.get(&key).await;
                         match maybe_value {
@@ -124,14 +133,51 @@ impl<
                 }
                 None => {
                     let (tx, _) = broadcast::channel(1);
-                    bookkeeper.insert(key.clone(), tx.clone());
-                    drop(bookkeeper);
-                    let value = self.factory.get(&key).await.map_err(|e| e.into())?;
-                    self.cache.insert(key.clone(), value.clone()).await;
-                    let _ = tx.send(value.clone());
-                    Ok(value)
+                    in_flight_factory_requests.insert(key.clone(), tx.clone());
+                    drop(in_flight_factory_requests);
+                    self.get_from_factory_or_fail_safe(key, tx).await
                 }
             },
+        }
+    }
+
+    async fn get_from_factory_or_fail_safe(
+        &mut self,
+        key: TKey,
+        tx: broadcast::Sender<Result<TValue, FusionCacheError>>,
+    ) -> Result<TValue, FusionCacheError> {
+        if let Some(fail_safe_cache) = &mut self.fail_safe_cache {
+            let fail_safe_result = fail_safe_cache.get(&key).await;
+            match fail_safe_result {
+                FailSafeResult::NotInFailSafeMode | FailSafeResult::CurrentCycleEnded => {
+                    self.get_from_factory(key, tx).await
+                }
+                FailSafeResult::Hit(value) => {
+                    let _ = tx.send(Ok(value.clone()));
+                    Ok(value)
+                }
+                FailSafeResult::Miss => {
+                    let _ = tx.send(Err(FusionCacheError::FactoryError.into()));
+                    Err(FusionCacheError::FactoryError)
+                }
+                FailSafeResult::TooManyCycles => {
+                    let _ = tx.send(Err(FusionCacheError::FactoryError.into()));
+                    Err(FusionCacheError::FactoryError)
+                }
+            }
+        } else {
+            let factory_result = self.factory.get(&key).await;
+            match factory_result {
+                Ok(value) => {
+                    self.cache.insert(key.clone(), value.clone()).await;
+                    let _ = tx.send(Ok(value.clone()));
+                    Ok(value)
+                }
+                Err(e) => {
+                    let _ = tx.send(Err(e.clone().into()));
+                    Err(e.into())
+                }
+            }
         }
     }
 
@@ -146,12 +192,57 @@ impl<
     pub async fn evict(&self, key: TKey) {
         self.cache.remove(&key).await;
     }
-}
 
-#[derive(Clone)]
-struct FailSafeConfiguration {
-    entry_ttl: u64,
-    failsafe_ttl: u64,
+    async fn get_from_factory(
+        &mut self,
+        key: TKey,
+        tx: broadcast::Sender<Result<TValue, FusionCacheError>>,
+    ) -> Result<TValue, FusionCacheError> {
+        let factory_result = self.factory.get(&key).await;
+        match factory_result {
+            Ok(value) => {
+                self.cache.insert(key.clone(), value.clone()).await;
+
+                // I can unwrap safely because I already know that fail_safe_cache is Some
+                self.fail_safe_cache
+                    .as_mut()
+                    .unwrap()
+                    .insert(key, value.clone())
+                    .await;
+                self.fail_safe_cache.as_mut().unwrap().close();
+                let _ = tx.send(Ok(value.clone()));
+                Ok(value)
+            }
+            Err(e) => {
+                let fail_safe_cache = self.fail_safe_cache.as_mut().unwrap();
+                fail_safe_cache.start_cycle();
+                let fail_safe_result = fail_safe_cache.get(&key).await;
+                match fail_safe_result {
+                    FailSafeResult::Hit(value) => Ok(value),
+                    FailSafeResult::Miss => {
+                        fail_safe_cache.close();
+                        let _ = tx.send(Err(e.into()));
+                        Err(FusionCacheError::FactoryError)
+                    }
+                    FailSafeResult::TooManyCycles => {
+                        panic!(
+                            "Got FailSafeResult::TooManyCycles, but we just started the first cycle"
+                        );
+                    }
+                    FailSafeResult::CurrentCycleEnded => {
+                        panic!(
+                            "Got FailSafeResult::CurrentCycleEnded, but we just started a cycle"
+                        );
+                    }
+                    FailSafeResult::NotInFailSafeMode => {
+                        panic!(
+                            "Got FailSafeResult::NotInFailSafeMode, but we just entered fail safe mode"
+                        );
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -166,7 +257,7 @@ mod tests {
         let key = 1;
         let mut handles = vec![];
         for _ in 0..100000 {
-            let cache = cache.clone();
+            let mut cache = cache.clone();
             handles.push(tokio::spawn(async move {
                 let value = cache.get_or_set(key).await.unwrap();
                 assert_eq!(value, 1);
