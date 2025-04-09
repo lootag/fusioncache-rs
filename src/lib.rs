@@ -106,29 +106,28 @@ impl<
 {
     pub async fn get_or_set(&mut self, key: TKey) -> Result<TValue, FusionCacheError> {
         let mut in_flight_factory_requests = self.in_flight_factory_requests.lock().await;
-        let sender = in_flight_factory_requests.get(&key).cloned();
+        let maybe_factory_sender = in_flight_factory_requests.get(&key).cloned();
         let maybe_entry = self.cache.get(&key).await;
         match maybe_entry {
             Some(entry) => {
-                if let Some(_) = sender {
+                if let Some(_) = maybe_factory_sender {
                     in_flight_factory_requests.remove(&key);
                 }
                 drop(in_flight_factory_requests);
                 Ok(entry)
             }
-            None => match sender {
-                Some(sender) => {
+            None => match maybe_factory_sender {
+                Some(factory_sender) => {
                     drop(in_flight_factory_requests);
-                    let mut receiver = sender.subscribe();
-                    let value = receiver.recv().await;
-                    if let Ok(value) = value {
-                        value.map_err(|e| e.into())
+                    let mut factory_receiver = factory_sender.subscribe();
+                    let factory_receiver_result = factory_receiver.recv().await;
+                    if let Ok(factory_result) = factory_receiver_result {
+                        factory_result.map_err(|e| e.into())
                     } else {
-                        let maybe_value = self.cache.get(&key).await;
-                        match maybe_value {
-                            Some(value) => Ok(value),
-                            None => Err(FusionCacheError::SystemCorruption),
-                        }
+                        self.cache
+                            .get(&key)
+                            .await
+                            .ok_or(FusionCacheError::SystemCorruption)
                     }
                 }
                 None => {
@@ -144,37 +143,39 @@ impl<
     async fn get_from_factory_or_fail_safe(
         &mut self,
         key: TKey,
-        tx: broadcast::Sender<Result<TValue, FusionCacheError>>,
+        factory_sender: broadcast::Sender<Result<TValue, FusionCacheError>>,
     ) -> Result<TValue, FusionCacheError> {
         if let Some(fail_safe_cache) = &mut self.fail_safe_cache {
             let fail_safe_result = fail_safe_cache.get(&key).await;
             match fail_safe_result {
                 FailSafeResult::NotInFailSafeMode | FailSafeResult::CurrentCycleEnded => {
-                    self.get_from_factory(key, tx).await
+                    self.get_from_factory(key, factory_sender).await
                 }
                 FailSafeResult::Hit(value) => {
-                    let _ = tx.send(Ok(value.clone()));
+                    let _ = factory_sender.send(Ok(value.clone()));
                     Ok(value)
                 }
                 FailSafeResult::Miss => {
-                    let _ = tx.send(Err(FusionCacheError::FactoryError.into()));
+                    fail_safe_cache.exit_failsafe_mode();
+                    let _ = factory_sender.send(Err(FusionCacheError::FactoryError.into()));
                     Err(FusionCacheError::FactoryError)
                 }
                 FailSafeResult::TooManyCycles => {
-                    let _ = tx.send(Err(FusionCacheError::FactoryError.into()));
+                    fail_safe_cache.exit_failsafe_mode();
+                    let _ = factory_sender.send(Err(FusionCacheError::FactoryError.into()));
                     Err(FusionCacheError::FactoryError)
                 }
             }
         } else {
             let factory_result = self.factory.get(&key).await;
             match factory_result {
-                Ok(value) => {
-                    self.cache.insert(key.clone(), value.clone()).await;
-                    let _ = tx.send(Ok(value.clone()));
-                    Ok(value)
+                Ok(factory_value) => {
+                    self.cache.insert(key.clone(), factory_value.clone()).await;
+                    let _ = factory_sender.send(Ok(factory_value.clone()));
+                    Ok(factory_value)
                 }
                 Err(e) => {
-                    let _ = tx.send(Err(e.clone().into()));
+                    let _ = factory_sender.send(Err(e.clone().into()));
                     Err(e.into())
                 }
             }
@@ -196,32 +197,32 @@ impl<
     async fn get_from_factory(
         &mut self,
         key: TKey,
-        tx: broadcast::Sender<Result<TValue, FusionCacheError>>,
+        factory_sender: broadcast::Sender<Result<TValue, FusionCacheError>>,
     ) -> Result<TValue, FusionCacheError> {
         let factory_result = self.factory.get(&key).await;
         match factory_result {
-            Ok(value) => {
-                self.cache.insert(key.clone(), value.clone()).await;
+            Ok(factory_value) => {
+                self.cache.insert(key.clone(), factory_value.clone()).await;
 
                 // I can unwrap safely because I already know that fail_safe_cache is Some
                 self.fail_safe_cache
                     .as_mut()
                     .unwrap()
-                    .insert(key, value.clone())
+                    .insert(key, factory_value.clone())
                     .await;
-                self.fail_safe_cache.as_mut().unwrap().close();
-                let _ = tx.send(Ok(value.clone()));
-                Ok(value)
+                self.fail_safe_cache.as_mut().unwrap().exit_failsafe_mode();
+                let _ = factory_sender.send(Ok(factory_value.clone()));
+                Ok(factory_value)
             }
             Err(e) => {
                 let fail_safe_cache = self.fail_safe_cache.as_mut().unwrap();
-                fail_safe_cache.start_cycle();
+                fail_safe_cache.start_failsafe_cycle();
                 let fail_safe_result = fail_safe_cache.get(&key).await;
                 match fail_safe_result {
                     FailSafeResult::Hit(value) => Ok(value),
                     FailSafeResult::Miss => {
-                        fail_safe_cache.close();
-                        let _ = tx.send(Err(e.into()));
+                        fail_safe_cache.exit_failsafe_mode();
+                        let _ = factory_sender.send(Err(e.into()));
                         Err(FusionCacheError::FactoryError)
                     }
                     FailSafeResult::TooManyCycles => {
