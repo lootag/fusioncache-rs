@@ -61,16 +61,13 @@ impl<
         self
     }
 
-    pub fn build<F: Factory<TKey, TValue, TError>>(
-        self,
-        factory: F,
-    ) -> FusionCache<TKey, TValue, TError, F> {
+    pub fn build<F: Factory<TKey, TValue, TError>>(self) -> FusionCache<TKey, TValue, TError, F> {
         FusionCache {
             cache: Cache::new(self.capacity),
             fail_safe_cache: self.fail_safe_configuration.map(|c| FailSafeCache::new(c)),
-            factory,
             in_flight_factory_requests: Arc::new(Mutex::new(HashMap::new())),
             phantom_t_error: PhantomData,
+            phantom_f: PhantomData,
         }
     }
 }
@@ -91,10 +88,10 @@ pub struct FusionCache<
 > {
     cache: Cache<TKey, TValue>,
     fail_safe_cache: Option<FailSafeCache<TKey, TValue>>,
-    factory: F,
     in_flight_factory_requests:
         Arc<Mutex<HashMap<TKey, broadcast::Sender<Result<TValue, FusionCacheError>>>>>,
     phantom_t_error: PhantomData<TError>,
+    phantom_f: PhantomData<F>,
 }
 
 impl<
@@ -104,7 +101,7 @@ impl<
     F: Factory<TKey, TValue, TError>,
 > FusionCache<TKey, TValue, TError, F>
 {
-    pub async fn get_or_set(&mut self, key: TKey) -> Result<TValue, FusionCacheError> {
+    pub async fn get_or_set(&mut self, key: TKey, factory: F) -> Result<TValue, FusionCacheError> {
         let mut in_flight_factory_requests = self.in_flight_factory_requests.lock().await;
         let maybe_factory_sender = in_flight_factory_requests.get(&key).cloned();
         let maybe_entry = self.cache.get(&key).await;
@@ -131,10 +128,11 @@ impl<
                     }
                 }
                 None => {
-                    let (tx, _) = broadcast::channel(1);
-                    in_flight_factory_requests.insert(key.clone(), tx.clone());
+                    let (factory_sender, _) = broadcast::channel(1);
+                    in_flight_factory_requests.insert(key.clone(), factory_sender.clone());
                     drop(in_flight_factory_requests);
-                    self.get_from_factory_or_fail_safe(key, tx).await
+                    self.get_from_factory_or_fail_safe(key, factory, factory_sender)
+                        .await
                 }
             },
         }
@@ -143,31 +141,42 @@ impl<
     async fn get_from_factory_or_fail_safe(
         &mut self,
         key: TKey,
+        factory: F,
         factory_sender: broadcast::Sender<Result<TValue, FusionCacheError>>,
     ) -> Result<TValue, FusionCacheError> {
         if let Some(fail_safe_cache) = &mut self.fail_safe_cache {
             let fail_safe_result = fail_safe_cache.get(&key).await;
             match fail_safe_result {
                 FailSafeResult::NotInFailSafeMode | FailSafeResult::CurrentCycleEnded => {
-                    self.get_from_factory(key, factory_sender).await
+                    self.do_get_from_factory_or_failsafe(key, factory, factory_sender)
+                        .await
                 }
                 FailSafeResult::Hit(value) => {
                     let _ = factory_sender.send(Ok(value.clone()));
                     Ok(value)
                 }
                 FailSafeResult::Miss => {
-                    fail_safe_cache.exit_failsafe_mode();
+                    fail_safe_cache.exit_failsafe_mode(key);
                     let _ = factory_sender.send(Err(FusionCacheError::FactoryError.into()));
                     Err(FusionCacheError::FactoryError)
                 }
                 FailSafeResult::TooManyCycles => {
-                    fail_safe_cache.exit_failsafe_mode();
-                    let _ = factory_sender.send(Err(FusionCacheError::FactoryError.into()));
-                    Err(FusionCacheError::FactoryError)
+                    fail_safe_cache.exit_failsafe_mode(key.clone());
+                    let factory_result = factory.get(&key).await;
+                    match factory_result {
+                        Ok(factory_value) => {
+                            let _ = factory_sender.send(Ok(factory_value.clone()));
+                            Ok(factory_value)
+                        }
+                        Err(e) => {
+                            let _ = factory_sender.send(Err(e.into()));
+                            Err(FusionCacheError::FactoryError)
+                        }
+                    }
                 }
             }
         } else {
-            let factory_result = self.factory.get(&key).await;
+            let factory_result = factory.get(&key).await;
             match factory_result {
                 Ok(factory_value) => {
                     self.cache.insert(key.clone(), factory_value.clone()).await;
@@ -192,43 +201,48 @@ impl<
 
     pub async fn evict(&self, key: TKey) {
         self.cache.remove(&key).await;
+        let mut in_flight_factory_requests = self.in_flight_factory_requests.lock().await;
+        let maybe_factory_result_sender = in_flight_factory_requests.get(&key);
+        if let Some(_) = maybe_factory_result_sender {
+            in_flight_factory_requests.remove(&key);
+        }
     }
 
-    async fn get_from_factory(
+    async fn do_get_from_factory_or_failsafe(
         &mut self,
         key: TKey,
+        factory: F,
         factory_sender: broadcast::Sender<Result<TValue, FusionCacheError>>,
     ) -> Result<TValue, FusionCacheError> {
-        let factory_result = self.factory.get(&key).await;
+        let factory_result = factory.get(&key).await;
         match factory_result {
             Ok(factory_value) => {
+                // I can unwrap safely because I already know that fail_safe_cache is Some
+                let fail_safe_cache = self.fail_safe_cache.as_mut().unwrap();
                 self.cache.insert(key.clone(), factory_value.clone()).await;
 
-                // I can unwrap safely because I already know that fail_safe_cache is Some
-                self.fail_safe_cache
-                    .as_mut()
-                    .unwrap()
-                    .insert(key, factory_value.clone())
+                fail_safe_cache
+                    .insert(key.clone(), factory_value.clone())
                     .await;
-                self.fail_safe_cache.as_mut().unwrap().exit_failsafe_mode();
+                fail_safe_cache.exit_failsafe_mode(key.clone());
                 let _ = factory_sender.send(Ok(factory_value.clone()));
                 Ok(factory_value)
             }
             Err(e) => {
                 let fail_safe_cache = self.fail_safe_cache.as_mut().unwrap();
-                fail_safe_cache.start_failsafe_cycle();
+                fail_safe_cache.start_failsafe_cycle(key.clone());
                 let fail_safe_result = fail_safe_cache.get(&key).await;
                 match fail_safe_result {
                     FailSafeResult::Hit(value) => Ok(value),
                     FailSafeResult::Miss => {
-                        fail_safe_cache.exit_failsafe_mode();
+                        fail_safe_cache.exit_failsafe_mode(key);
                         let _ = factory_sender.send(Err(e.into()));
                         Err(FusionCacheError::FactoryError)
                     }
                     FailSafeResult::TooManyCycles => {
-                        panic!(
-                            "Got FailSafeResult::TooManyCycles, but we just started the first cycle"
-                        );
+                        fail_safe_cache.exit_failsafe_mode(key);
+                        let _ = factory_sender.send(Err(e.into()));
+                        Err(FusionCacheError::FactoryError)
                     }
                     FailSafeResult::CurrentCycleEnded => {
                         panic!(
@@ -248,23 +262,43 @@ impl<
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
 
     use futures::future::join_all;
 
     #[tokio::test]
     async fn test_factory_only_gets_called_once_if_multiple_threads_request_the_same_key() {
-        let cache = FusionCacheBuilder::new().build(TestFactory::new());
+        let factory = TestFactory::new();
+        let cache = FusionCacheBuilder::new().build();
         let key = 1;
         let mut handles = vec![];
         for _ in 0..100000 {
+            let factory = factory.clone();
             let mut cache = cache.clone();
             handles.push(tokio::spawn(async move {
-                let value = cache.get_or_set(key).await.unwrap();
+                let value = cache.get_or_set(key, factory.clone()).await.unwrap();
                 assert_eq!(value, 1);
             }));
         }
         join_all(handles).await;
+    }
+
+    #[tokio::test]
+    async fn test_failsafe_hits_when_there_is_an_entry_in_failsafe_cache() {
+        let factory = FallibleTestFactory::new();
+        let mut cache = FusionCacheBuilder::new()
+            .with_fail_safe(Duration::from_secs(10), Duration::from_secs(5), Some(3))
+            .build();
+
+        let value = cache.get_or_set(1, factory.clone()).await;
+        assert_eq!(1, value.unwrap());
+
+        cache.evict(1).await;
+
+        let failsafe_value = cache.get_or_set(1, factory.clone()).await;
+        assert_eq!(1, failsafe_value.unwrap())
     }
 
     #[derive(Clone)]
@@ -281,7 +315,7 @@ mod tests {
     }
 
     impl Factory<u32, u32, TestFactoryError> for TestFactory {
-        async fn get(&self, key: &u32) -> Result<u32, TestFactoryError> {
+        async fn get(&self, _: &u32) -> Result<u32, TestFactoryError> {
             let mut counter = self.counter.lock().await;
             tokio::time::sleep(std::time::Duration::from_millis(3000)).await;
             *counter += 1;
@@ -295,6 +329,31 @@ mod tests {
     impl Into<FusionCacheError> for TestFactoryError {
         fn into(self) -> FusionCacheError {
             FusionCacheError::Other
+        }
+    }
+
+    #[derive(Clone)]
+    struct FallibleTestFactory {
+        counter: Arc<Mutex<u32>>,
+    }
+
+    impl FallibleTestFactory {
+        pub fn new() -> Self {
+            Self {
+                counter: Arc::new(Mutex::new(0)),
+            }
+        }
+    }
+
+    impl Factory<u32, u32, TestFactoryError> for FallibleTestFactory {
+        async fn get(&self, _: &u32) -> Result<u32, TestFactoryError> {
+            let mut counter = self.counter.lock().await;
+            *counter += 1;
+            if *counter % 2 == 0 {
+                Err(TestFactoryError)
+            } else {
+                Ok(1)
+            }
         }
     }
 }
