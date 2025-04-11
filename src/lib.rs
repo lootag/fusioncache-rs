@@ -17,20 +17,15 @@ pub trait Factory<
 pub struct FusionCacheBuilder<
     TKey: Hash + Eq + Send + Sync + Clone + 'static,
     TValue: Clone + Send + Sync + 'static,
-    TError: Clone + Send + Sync + Into<FusionCacheError> + 'static,
 > {
     capacity: u64,
     fail_safe_configuration: Option<FailSafeConfiguration>,
     phantom_t_key: PhantomData<TKey>,
     phantom_t_value: PhantomData<TValue>,
-    phantom_t_error: PhantomData<TError>,
 }
 
-impl<
-    TKey: Hash + Eq + Send + Sync + Clone + 'static,
-    TValue: Clone + Send + Sync + 'static,
-    TError: Clone + Send + Sync + Into<FusionCacheError> + 'static,
-> FusionCacheBuilder<TKey, TValue, TError>
+impl<TKey: Hash + Eq + Send + Sync + Clone + 'static, TValue: Clone + Send + Sync + 'static>
+    FusionCacheBuilder<TKey, TValue>
 {
     pub fn new() -> Self {
         Self {
@@ -38,7 +33,6 @@ impl<
             fail_safe_configuration: None,
             phantom_t_key: PhantomData,
             phantom_t_value: PhantomData,
-            phantom_t_error: PhantomData,
         }
     }
 
@@ -61,13 +55,11 @@ impl<
         self
     }
 
-    pub fn build<F: Factory<TKey, TValue, TError>>(self) -> FusionCache<TKey, TValue, TError, F> {
+    pub fn build(self) -> FusionCache<TKey, TValue> {
         FusionCache {
             cache: Cache::new(self.capacity),
             fail_safe_cache: self.fail_safe_configuration.map(|c| FailSafeCache::new(c)),
             in_flight_factory_requests: Arc::new(Mutex::new(HashMap::new())),
-            phantom_t_error: PhantomData,
-            phantom_f: PhantomData,
         }
     }
 }
@@ -83,25 +75,24 @@ pub enum FusionCacheError {
 pub struct FusionCache<
     TKey: Hash + Eq + Send + Sync + Clone + 'static,
     TValue: Clone + Send + Sync + Clone + 'static,
-    TError: Clone + Send + Sync + Into<FusionCacheError> + 'static,
-    F: Factory<TKey, TValue, TError>,
 > {
     cache: Cache<TKey, TValue>,
     fail_safe_cache: Option<FailSafeCache<TKey, TValue>>,
     in_flight_factory_requests:
         Arc<Mutex<HashMap<TKey, broadcast::Sender<Result<TValue, FusionCacheError>>>>>,
-    phantom_t_error: PhantomData<TError>,
-    phantom_f: PhantomData<F>,
 }
 
-impl<
-    TKey: Hash + Eq + Send + Sync + Clone + 'static,
-    TValue: Clone + Send + Sync + Clone + 'static,
-    TError: Clone + Send + Sync + Into<FusionCacheError> + 'static,
-    F: Factory<TKey, TValue, TError>,
-> FusionCache<TKey, TValue, TError, F>
+impl<TKey: Hash + Eq + Send + Sync + Clone + 'static, TValue: Clone + Send + Sync + Clone + 'static>
+    FusionCache<TKey, TValue>
 {
-    pub async fn get_or_set(&mut self, key: TKey, factory: F) -> Result<TValue, FusionCacheError> {
+    pub async fn get_or_set<
+        TError: Clone + Send + Sync + Into<FusionCacheError> + 'static,
+        F: Factory<TKey, TValue, TError>,
+    >(
+        &mut self,
+        key: TKey,
+        factory: F,
+    ) -> Result<TValue, FusionCacheError> {
         let mut in_flight_factory_requests = self.in_flight_factory_requests.lock().await;
         let maybe_factory_sender = in_flight_factory_requests.get(&key).cloned();
         let maybe_entry = self.cache.get(&key).await;
@@ -132,7 +123,10 @@ impl<
         }
     }
 
-    async fn get_from_factory_or_fail_safe(
+    async fn get_from_factory_or_fail_safe<
+        TError: Clone + Send + Sync + Into<FusionCacheError> + 'static,
+        F: Factory<TKey, TValue, TError>,
+    >(
         &mut self,
         key: TKey,
         factory: F,
@@ -147,23 +141,13 @@ impl<
                 }
                 FailSafeResult::Hit(value) => {
                     let _ = factory_sender.send(Ok(value.clone()));
-                    let mut in_flight_factory_requests =
-                        self.in_flight_factory_requests.lock().await;
-                    if let Some(_) = in_flight_factory_requests.get(&key) {
-                        in_flight_factory_requests.remove(&key);
-                    }
-                    drop(in_flight_factory_requests);
+                    self.remove_from_in_flight_factory_requests(&key).await;
                     Ok(value)
                 }
                 FailSafeResult::Miss => {
                     fail_safe_cache.exit_failsafe_mode(key.clone()).await;
                     let _ = factory_sender.send(Err(FusionCacheError::FactoryError.into()));
-                    let mut in_flight_factory_requests =
-                        self.in_flight_factory_requests.lock().await;
-                    if let Some(_) = in_flight_factory_requests.get(&key) {
-                        in_flight_factory_requests.remove(&key);
-                    }
-                    drop(in_flight_factory_requests);
+                    self.remove_from_in_flight_factory_requests(&key).await;
                     Err(FusionCacheError::FactoryError)
                 }
                 FailSafeResult::TooManyCycles => {
@@ -172,22 +156,12 @@ impl<
                     match factory_result {
                         Ok(factory_value) => {
                             let _ = factory_sender.send(Ok(factory_value.clone()));
-                            let mut in_flight_factory_requests =
-                                self.in_flight_factory_requests.lock().await;
-                            if let Some(_) = in_flight_factory_requests.get(&key) {
-                                in_flight_factory_requests.remove(&key);
-                            }
-                            drop(in_flight_factory_requests);
+                            self.remove_from_in_flight_factory_requests(&key).await;
                             Ok(factory_value)
                         }
                         Err(e) => {
                             let _ = factory_sender.send(Err(e.into()));
-                            let mut in_flight_factory_requests =
-                                self.in_flight_factory_requests.lock().await;
-                            if let Some(_) = in_flight_factory_requests.get(&key) {
-                                in_flight_factory_requests.remove(&key);
-                            }
-                            drop(in_flight_factory_requests);
+                            self.remove_from_in_flight_factory_requests(&key).await;
                             Err(FusionCacheError::FactoryError)
                         }
                     }
@@ -199,14 +173,24 @@ impl<
                 Ok(factory_value) => {
                     self.cache.insert(key.clone(), factory_value.clone()).await;
                     let _ = factory_sender.send(Ok(factory_value.clone()));
+                    self.remove_from_in_flight_factory_requests(&key).await;
                     Ok(factory_value)
                 }
                 Err(e) => {
                     let _ = factory_sender.send(Err(e.clone().into()));
+                    self.remove_from_in_flight_factory_requests(&key).await;
                     Err(e.into())
                 }
             }
         }
+    }
+
+    async fn remove_from_in_flight_factory_requests(&mut self, key: &TKey) {
+        let mut in_flight_factory_requests = self.in_flight_factory_requests.lock().await;
+        if let Some(_) = in_flight_factory_requests.get(key) {
+            in_flight_factory_requests.remove(key);
+        }
+        drop(in_flight_factory_requests);
     }
 
     pub async fn get(&self, key: TKey) -> Option<TValue> {
@@ -221,7 +205,10 @@ impl<
         self.cache.remove(&key).await;
     }
 
-    async fn do_get_from_factory_or_failsafe(
+    async fn do_get_from_factory_or_failsafe<
+        TError: Clone + Send + Sync + Into<FusionCacheError> + 'static,
+        F: Factory<TKey, TValue, TError>,
+    >(
         &mut self,
         key: TKey,
         factory: F,
@@ -239,11 +226,7 @@ impl<
                     .await;
                 fail_safe_cache.exit_failsafe_mode(key.clone()).await;
                 let _ = factory_sender.send(Ok(factory_value.clone()));
-                let mut in_flight_factory_requests = self.in_flight_factory_requests.lock().await;
-                if let Some(_) = in_flight_factory_requests.get(&key) {
-                    in_flight_factory_requests.remove(&key);
-                }
-                drop(in_flight_factory_requests);
+                self.remove_from_in_flight_factory_requests(&key).await;
                 Ok(factory_value)
             }
             Err(e) => {
@@ -253,34 +236,19 @@ impl<
                 match fail_safe_result {
                     FailSafeResult::Hit(value) => {
                         let _ = factory_sender.send(Ok(value.clone()));
-                        let mut in_flight_factory_requests =
-                            self.in_flight_factory_requests.lock().await;
-                        if let Some(_) = in_flight_factory_requests.get(&key) {
-                            in_flight_factory_requests.remove(&key);
-                        }
-                        drop(in_flight_factory_requests);
+                        self.remove_from_in_flight_factory_requests(&key).await;
                         Ok(value)
                     }
                     FailSafeResult::Miss => {
                         fail_safe_cache.exit_failsafe_mode(key.clone()).await;
                         let _ = factory_sender.send(Err(e.into()));
-                        let mut in_flight_factory_requests =
-                            self.in_flight_factory_requests.lock().await;
-                        if let Some(_) = in_flight_factory_requests.get(&key) {
-                            in_flight_factory_requests.remove(&key);
-                        }
-                        drop(in_flight_factory_requests);
+                        self.remove_from_in_flight_factory_requests(&key).await;
                         Err(FusionCacheError::FactoryError)
                     }
                     FailSafeResult::TooManyCycles => {
                         fail_safe_cache.exit_failsafe_mode(key.clone()).await;
                         let _ = factory_sender.send(Err(e.into()));
-                        let mut in_flight_factory_requests =
-                            self.in_flight_factory_requests.lock().await;
-                        if let Some(_) = in_flight_factory_requests.get(&key) {
-                            in_flight_factory_requests.remove(&key);
-                        }
-                        drop(in_flight_factory_requests);
+                        self.remove_from_in_flight_factory_requests(&key).await;
                         Err(FusionCacheError::FactoryError)
                     }
                     FailSafeResult::CurrentCycleEnded => {
