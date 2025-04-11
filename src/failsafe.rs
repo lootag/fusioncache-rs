@@ -1,6 +1,7 @@
 use chrono::{DateTime, Utc};
 use moka::future::Cache;
-use std::{collections::HashMap, hash::Hash};
+use std::{collections::HashMap, hash::Hash, sync::Arc};
+use tokio::sync::Mutex;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum FailSafeResult<TValue> {
@@ -38,8 +39,8 @@ pub(crate) struct FailSafeCache<
     TValue: Clone + Send + Sync + 'static,
 > {
     configuration: FailSafeConfiguration,
-    cycle_start: HashMap<TKey, DateTime<Utc>>,
-    current_cycle: HashMap<TKey, u64>,
+    cycle_start: Arc<Mutex<HashMap<TKey, DateTime<Utc>>>>,
+    current_cycle: Arc<Mutex<HashMap<TKey, u64>>>,
     cache: Cache<TKey, TValue>,
 }
 
@@ -52,8 +53,8 @@ impl<TKey: Hash + Eq + Send + Sync + Clone + 'static, TValue: Clone + Send + Syn
             .build();
         Self {
             configuration,
-            cycle_start: HashMap::new(),
-            current_cycle: HashMap::new(),
+            cycle_start: Arc::new(Mutex::new(HashMap::new())),
+            current_cycle: Arc::new(Mutex::new(HashMap::new())),
             cache,
         }
     }
@@ -62,29 +63,44 @@ impl<TKey: Hash + Eq + Send + Sync + Clone + 'static, TValue: Clone + Send + Syn
 impl<TKey: Hash + Eq + Send + Sync + Clone + 'static, TValue: Clone + Send + Sync + 'static>
     FailSafeCache<TKey, TValue>
 {
-    pub fn start_failsafe_cycle(&mut self, key: TKey) {
-        self.cycle_start.insert(key.clone(), Utc::now());
-        self.current_cycle.entry(key.clone()).or_insert(0);
+    pub async fn start_failsafe_cycle(&mut self, key: TKey) {
+        let mut cycle_start = self.cycle_start.lock().await;
+        let mut current_cycle = self.current_cycle.lock().await;
+        cycle_start.insert(key.clone(), Utc::now());
+        drop(cycle_start);
+        if !current_cycle.contains_key(&key) {
+            current_cycle.insert(key.clone(), 0);
+        }
+        drop(current_cycle);
     }
 
-    pub fn exit_failsafe_mode(&mut self, key: TKey) {
-        self.cycle_start.remove(&key);
-        self.current_cycle.remove(&key);
+    pub async fn exit_failsafe_mode(&mut self, key: TKey) {
+        let mut cycle_start = self.cycle_start.lock().await;
+        let mut current_cycle = self.current_cycle.lock().await;
+        cycle_start.remove(&key);
+        drop(cycle_start);
+        current_cycle.remove(&key);
+        drop(current_cycle);
     }
 
     pub async fn get(&mut self, key: &TKey) -> FailSafeResult<TValue> {
-        if let Some(cycle_start) = self.cycle_start.get(key) {
+        let cycle_start_map = self.cycle_start.lock().await;
+        let mut current_cycle_map = self.current_cycle.lock().await;
+        if let Some(cycle_start) = cycle_start_map.get(key) {
             if Utc::now() >= cycle_start.clone() + self.configuration.failsafe_ttl {
+                drop(current_cycle_map);
                 return FailSafeResult::CurrentCycleEnded;
             }
+            drop(cycle_start_map);
             if let Some(max_cycles) = self.configuration.max_cycles {
-                let current_cycle = self.current_cycle.get(key).unwrap();
+                let current_cycle = current_cycle_map.get(key).unwrap();
                 if *current_cycle >= max_cycles {
+                    drop(current_cycle_map);
                     return FailSafeResult::TooManyCycles;
                 } else {
                     let updated_current_cycle = *current_cycle + 1;
-                    self.current_cycle
-                        .insert(key.clone(), updated_current_cycle);
+                    current_cycle_map.insert(key.clone(), updated_current_cycle);
+                    drop(current_cycle_map);
                     if let Some(entry) = self.cache.get(key).await {
                         return FailSafeResult::Hit(entry);
                     } else {
@@ -92,6 +108,7 @@ impl<TKey: Hash + Eq + Send + Sync + Clone + 'static, TValue: Clone + Send + Syn
                     }
                 }
             } else {
+                drop(current_cycle_map);
                 if let Some(entry) = self.cache.get(key).await {
                     return FailSafeResult::Hit(entry);
                 } else {
@@ -132,7 +149,7 @@ mod tests {
             None,
         ));
         cache.insert(1, 1).await;
-        cache.start_failsafe_cycle(1);
+        cache.start_failsafe_cycle(1).await;
         tokio::time::sleep(std::time::Duration::from_secs(6)).await;
         let result = cache.get(&1).await;
         assert_eq!(result, FailSafeResult::CurrentCycleEnded);
@@ -146,7 +163,7 @@ mod tests {
             None,
         ));
         cache.insert(1, 1).await;
-        cache.start_failsafe_cycle(1);
+        cache.start_failsafe_cycle(1).await;
         let result = cache.get(&1).await;
         assert_eq!(result, FailSafeResult::Hit(1));
     }
@@ -160,7 +177,7 @@ mod tests {
         ));
         cache.insert(1, 1).await;
         tokio::time::sleep(std::time::Duration::from_secs(4)).await;
-        cache.start_failsafe_cycle(1);
+        cache.start_failsafe_cycle(1).await;
         let result = cache.get(&1).await;
         assert_eq!(result, FailSafeResult::Miss);
     }
@@ -174,19 +191,19 @@ mod tests {
             Some(3),
         ));
         cache.insert(1, 1).await;
-        cache.start_failsafe_cycle(1);
+        cache.start_failsafe_cycle(1).await;
         assert_eq!(cache.get(&1).await, FailSafeResult::Hit(1));
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
         assert_eq!(cache.get(&1).await, FailSafeResult::CurrentCycleEnded);
-        cache.start_failsafe_cycle(1);
+        cache.start_failsafe_cycle(1).await;
         assert_eq!(cache.get(&1).await, FailSafeResult::Hit(1));
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
         assert_eq!(cache.get(&1).await, FailSafeResult::CurrentCycleEnded);
-        cache.start_failsafe_cycle(1);
+        cache.start_failsafe_cycle(1).await;
         assert_eq!(cache.get(&1).await, FailSafeResult::Hit(1));
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
         assert_eq!(cache.get(&1).await, FailSafeResult::CurrentCycleEnded);
-        cache.start_failsafe_cycle(1);
+        cache.start_failsafe_cycle(1).await;
         let result = cache.get(&1).await;
         assert_eq!(result, FailSafeResult::TooManyCycles);
     }

@@ -156,12 +156,12 @@ impl<
                     Ok(value)
                 }
                 FailSafeResult::Miss => {
-                    fail_safe_cache.exit_failsafe_mode(key);
+                    fail_safe_cache.exit_failsafe_mode(key).await;
                     let _ = factory_sender.send(Err(FusionCacheError::FactoryError.into()));
                     Err(FusionCacheError::FactoryError)
                 }
                 FailSafeResult::TooManyCycles => {
-                    fail_safe_cache.exit_failsafe_mode(key.clone());
+                    fail_safe_cache.exit_failsafe_mode(key.clone()).await;
                     let factory_result = factory.get(&key).await;
                     match factory_result {
                         Ok(factory_value) => {
@@ -224,23 +224,23 @@ impl<
                 fail_safe_cache
                     .insert(key.clone(), factory_value.clone())
                     .await;
-                fail_safe_cache.exit_failsafe_mode(key.clone());
+                fail_safe_cache.exit_failsafe_mode(key.clone()).await;
                 let _ = factory_sender.send(Ok(factory_value.clone()));
                 Ok(factory_value)
             }
             Err(e) => {
                 let fail_safe_cache = self.fail_safe_cache.as_mut().unwrap();
-                fail_safe_cache.start_failsafe_cycle(key.clone());
+                fail_safe_cache.start_failsafe_cycle(key.clone()).await;
                 let fail_safe_result = fail_safe_cache.get(&key).await;
                 match fail_safe_result {
                     FailSafeResult::Hit(value) => Ok(value),
                     FailSafeResult::Miss => {
-                        fail_safe_cache.exit_failsafe_mode(key);
+                        fail_safe_cache.exit_failsafe_mode(key.clone()).await;
                         let _ = factory_sender.send(Err(e.into()));
                         Err(FusionCacheError::FactoryError)
                     }
                     FailSafeResult::TooManyCycles => {
-                        fail_safe_cache.exit_failsafe_mode(key);
+                        fail_safe_cache.exit_failsafe_mode(key).await;
                         let _ = factory_sender.send(Err(e.into()));
                         Err(FusionCacheError::FactoryError)
                     }
