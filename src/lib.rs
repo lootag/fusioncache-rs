@@ -106,13 +106,7 @@ impl<
         let maybe_factory_sender = in_flight_factory_requests.get(&key).cloned();
         let maybe_entry = self.cache.get(&key).await;
         match maybe_entry {
-            Some(entry) => {
-                if let Some(_) = maybe_factory_sender {
-                    in_flight_factory_requests.remove(&key);
-                }
-                drop(in_flight_factory_requests);
-                Ok(entry)
-            }
+            Some(entry) => Ok(entry),
             None => match maybe_factory_sender {
                 Some(factory_sender) => {
                     drop(in_flight_factory_requests);
@@ -153,11 +147,23 @@ impl<
                 }
                 FailSafeResult::Hit(value) => {
                     let _ = factory_sender.send(Ok(value.clone()));
+                    let mut in_flight_factory_requests =
+                        self.in_flight_factory_requests.lock().await;
+                    if let Some(_) = in_flight_factory_requests.get(&key) {
+                        in_flight_factory_requests.remove(&key);
+                    }
+                    drop(in_flight_factory_requests);
                     Ok(value)
                 }
                 FailSafeResult::Miss => {
-                    fail_safe_cache.exit_failsafe_mode(key).await;
+                    fail_safe_cache.exit_failsafe_mode(key.clone()).await;
                     let _ = factory_sender.send(Err(FusionCacheError::FactoryError.into()));
+                    let mut in_flight_factory_requests =
+                        self.in_flight_factory_requests.lock().await;
+                    if let Some(_) = in_flight_factory_requests.get(&key) {
+                        in_flight_factory_requests.remove(&key);
+                    }
+                    drop(in_flight_factory_requests);
                     Err(FusionCacheError::FactoryError)
                 }
                 FailSafeResult::TooManyCycles => {
@@ -166,10 +172,22 @@ impl<
                     match factory_result {
                         Ok(factory_value) => {
                             let _ = factory_sender.send(Ok(factory_value.clone()));
+                            let mut in_flight_factory_requests =
+                                self.in_flight_factory_requests.lock().await;
+                            if let Some(_) = in_flight_factory_requests.get(&key) {
+                                in_flight_factory_requests.remove(&key);
+                            }
+                            drop(in_flight_factory_requests);
                             Ok(factory_value)
                         }
                         Err(e) => {
                             let _ = factory_sender.send(Err(e.into()));
+                            let mut in_flight_factory_requests =
+                                self.in_flight_factory_requests.lock().await;
+                            if let Some(_) = in_flight_factory_requests.get(&key) {
+                                in_flight_factory_requests.remove(&key);
+                            }
+                            drop(in_flight_factory_requests);
                             Err(FusionCacheError::FactoryError)
                         }
                     }
@@ -201,11 +219,6 @@ impl<
 
     pub async fn evict(&self, key: TKey) {
         self.cache.remove(&key).await;
-        let mut in_flight_factory_requests = self.in_flight_factory_requests.lock().await;
-        let maybe_factory_result_sender = in_flight_factory_requests.get(&key);
-        if let Some(_) = maybe_factory_result_sender {
-            in_flight_factory_requests.remove(&key);
-        }
     }
 
     async fn do_get_from_factory_or_failsafe(
@@ -226,6 +239,11 @@ impl<
                     .await;
                 fail_safe_cache.exit_failsafe_mode(key.clone()).await;
                 let _ = factory_sender.send(Ok(factory_value.clone()));
+                let mut in_flight_factory_requests = self.in_flight_factory_requests.lock().await;
+                if let Some(_) = in_flight_factory_requests.get(&key) {
+                    in_flight_factory_requests.remove(&key);
+                }
+                drop(in_flight_factory_requests);
                 Ok(factory_value)
             }
             Err(e) => {
@@ -233,15 +251,36 @@ impl<
                 fail_safe_cache.start_failsafe_cycle(key.clone()).await;
                 let fail_safe_result = fail_safe_cache.get(&key).await;
                 match fail_safe_result {
-                    FailSafeResult::Hit(value) => Ok(value),
+                    FailSafeResult::Hit(value) => {
+                        let _ = factory_sender.send(Ok(value.clone()));
+                        let mut in_flight_factory_requests =
+                            self.in_flight_factory_requests.lock().await;
+                        if let Some(_) = in_flight_factory_requests.get(&key) {
+                            in_flight_factory_requests.remove(&key);
+                        }
+                        drop(in_flight_factory_requests);
+                        Ok(value)
+                    }
                     FailSafeResult::Miss => {
                         fail_safe_cache.exit_failsafe_mode(key.clone()).await;
                         let _ = factory_sender.send(Err(e.into()));
+                        let mut in_flight_factory_requests =
+                            self.in_flight_factory_requests.lock().await;
+                        if let Some(_) = in_flight_factory_requests.get(&key) {
+                            in_flight_factory_requests.remove(&key);
+                        }
+                        drop(in_flight_factory_requests);
                         Err(FusionCacheError::FactoryError)
                     }
                     FailSafeResult::TooManyCycles => {
-                        fail_safe_cache.exit_failsafe_mode(key).await;
+                        fail_safe_cache.exit_failsafe_mode(key.clone()).await;
                         let _ = factory_sender.send(Err(e.into()));
+                        let mut in_flight_factory_requests =
+                            self.in_flight_factory_requests.lock().await;
+                        if let Some(_) = in_flight_factory_requests.get(&key) {
+                            in_flight_factory_requests.remove(&key);
+                        }
+                        drop(in_flight_factory_requests);
                         Err(FusionCacheError::FactoryError)
                     }
                     FailSafeResult::CurrentCycleEnded => {
@@ -301,6 +340,146 @@ mod tests {
         assert_eq!(1, failsafe_value.unwrap())
     }
 
+    #[tokio::test]
+    async fn test_failsafe_hits_when_there_is_an_entry_in_failsafe_cache_multithreaded() {
+        let factory = FallibleTestFactory::new();
+        let mut cache = FusionCacheBuilder::new()
+            .with_fail_safe(Duration::from_secs(10), Duration::from_secs(5), Some(3))
+            .build();
+
+        let value = cache.get_or_set(1, factory.clone()).await;
+        assert_eq!(1, value.unwrap());
+
+        cache.evict(1).await;
+
+        let mut handles = vec![];
+        for _ in 0..100000 {
+            let factory = factory.clone();
+            let mut cache = cache.clone();
+            handles.push(tokio::spawn(async move {
+                let value = cache.get_or_set(1, factory.clone()).await.unwrap();
+                assert_eq!(value, 1);
+            }));
+        }
+        join_all(handles).await;
+    }
+
+    #[tokio::test]
+    async fn test_failsafe_misses_when_there_is_no_entry_in_failsafe_cache() {
+        let factory = FallibleTestFactory::new();
+        let mut cache = FusionCacheBuilder::new()
+            .with_fail_safe(Duration::from_secs(2), Duration::from_secs(1), Some(3))
+            .build();
+
+        let value = cache.get_or_set(1, factory.clone()).await;
+        assert_eq!(1, value.unwrap());
+
+        cache.evict(1).await;
+        tokio::time::sleep(Duration::from_secs(3)).await;
+
+        let failsafe_value = cache.get_or_set(1, factory.clone()).await;
+        assert!(failsafe_value.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_failsafe_misses_when_there_is_no_entry_in_failsafe_cache_multithreaded() {
+        let factory = FallibleTestFactory::new();
+        let mut cache = FusionCacheBuilder::new()
+            .with_fail_safe(Duration::from_secs(2), Duration::from_secs(1), Some(3))
+            .build();
+
+        let value = cache.get_or_set(1, factory.clone()).await;
+        assert_eq!(1, value.unwrap());
+
+        cache.evict(1).await;
+        tokio::time::sleep(Duration::from_secs(3)).await;
+
+        let mut handles = vec![];
+        for _ in 0..100000 {
+            let factory = factory.clone();
+            let mut cache = cache.clone();
+            handles.push(tokio::spawn(async move {
+                let value = cache.get_or_set(1, factory.clone()).await;
+                assert!(value.is_err());
+            }));
+        }
+        join_all(handles).await;
+    }
+
+    #[tokio::test]
+    async fn test_failsafe_misses_when_the_maximum_number_of_cycles_is_reached() {
+        let factory = FallibleTestFactory::new();
+        let mut cache = FusionCacheBuilder::new()
+            .with_fail_safe(Duration::from_secs(15), Duration::from_secs(1), Some(2))
+            .build();
+
+        let value = cache.get_or_set(1, factory.clone()).await;
+        assert_eq!(1, value.unwrap());
+
+        cache.evict(1).await;
+
+        let failsafe_value = cache.get_or_set(1, factory.clone()).await;
+        assert_eq!(1, failsafe_value.unwrap());
+
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        let failsafe_value = cache.get_or_set(1, factory.clone()).await;
+        assert_eq!(1, failsafe_value.unwrap());
+
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        let failsafe_value = cache.get_or_set(1, factory.clone()).await;
+        assert!(failsafe_value.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_failsafe_misses_when_the_maximum_number_of_cycles_is_reached_multithreaded() {
+        let factory = FallibleTestFactory::new();
+        let mut cache = FusionCacheBuilder::new()
+            .with_fail_safe(Duration::from_secs(15), Duration::from_secs(1), Some(2))
+            .build();
+
+        let value = cache.get_or_set(1, factory.clone()).await;
+        assert_eq!(1, value.unwrap());
+
+        cache.evict(1).await;
+
+        let mut handles = vec![];
+        for _ in 0..100000 {
+            let factory = factory.clone();
+            let mut cache = cache.clone();
+            handles.push(tokio::spawn(async move {
+                let value = cache.get_or_set(1, factory.clone()).await;
+                assert_eq!(1, value.unwrap());
+            }));
+        }
+        join_all(handles).await;
+
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        let mut handles = vec![];
+        for _ in 0..100000 {
+            let factory = factory.clone();
+            let mut cache = cache.clone();
+            handles.push(tokio::spawn(async move {
+                let value = cache.get_or_set(1, factory.clone()).await;
+                assert_eq!(1, value.unwrap());
+            }));
+        }
+        join_all(handles).await;
+
+        let mut handles = vec![];
+        for _ in 0..100000 {
+            let factory = factory.clone();
+            let mut cache = cache.clone();
+            handles.push(tokio::spawn(async move {
+                let value = cache.get_or_set(1, factory.clone()).await;
+                assert!(value.is_err());
+            }));
+        }
+        join_all(handles).await;
+    }
+
     #[derive(Clone)]
     struct TestFactory {
         counter: Arc<Mutex<u32>>,
@@ -349,10 +528,10 @@ mod tests {
         async fn get(&self, _: &u32) -> Result<u32, TestFactoryError> {
             let mut counter = self.counter.lock().await;
             *counter += 1;
-            if *counter % 2 == 0 {
-                Err(TestFactoryError)
-            } else {
+            if *counter == 1 {
                 Ok(1)
+            } else {
+                Err(TestFactoryError)
             }
         }
     }
