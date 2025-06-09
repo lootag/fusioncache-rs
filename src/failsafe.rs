@@ -17,6 +17,7 @@ pub(crate) struct FailSafeConfiguration {
     entry_ttl: std::time::Duration,
     failsafe_ttl: std::time::Duration,
     max_cycles: Option<u64>,
+    soft_timeout: Option<std::time::Duration>,
 }
 
 impl FailSafeConfiguration {
@@ -24,11 +25,13 @@ impl FailSafeConfiguration {
         entry_ttl: std::time::Duration,
         failsafe_ttl: std::time::Duration,
         max_cycles: Option<u64>,
+        soft_timeout: Option<std::time::Duration>,
     ) -> Self {
         Self {
             entry_ttl,
             failsafe_ttl,
             max_cycles,
+            soft_timeout,
         }
     }
 }
@@ -123,6 +126,10 @@ impl<TKey: Hash + Eq + Send + Sync + Clone + 'static, TValue: Clone + Send + Syn
     pub async fn insert(&self, key: TKey, value: TValue) {
         self.cache.insert(key, value).await;
     }
+
+    pub fn soft_timeout(&self) -> Option<std::time::Duration> {
+        self.configuration.soft_timeout
+    }
 }
 
 #[cfg(test)]
@@ -135,6 +142,7 @@ mod tests {
             std::time::Duration::from_secs(60),
             std::time::Duration::from_secs(5),
             None,
+            None,
         ));
         cache.insert(1, 1).await;
         let result = cache.get(&1).await;
@@ -146,6 +154,7 @@ mod tests {
         let mut cache = FailSafeCache::new(FailSafeConfiguration::new(
             std::time::Duration::from_secs(60),
             std::time::Duration::from_secs(5),
+            None,
             None,
         ));
         cache.insert(1, 1).await;
@@ -161,6 +170,7 @@ mod tests {
             std::time::Duration::from_secs(60),
             std::time::Duration::from_secs(5),
             None,
+            None,
         ));
         cache.insert(1, 1).await;
         cache.start_failsafe_cycle(1).await;
@@ -173,6 +183,7 @@ mod tests {
         let mut cache = FailSafeCache::new(FailSafeConfiguration::new(
             std::time::Duration::from_secs(3),
             std::time::Duration::from_secs(2),
+            None,
             None,
         ));
         cache.insert(1, 1).await;
@@ -189,6 +200,7 @@ mod tests {
             std::time::Duration::from_secs(60),
             std::time::Duration::from_secs(1),
             Some(3),
+            None,
         ));
         cache.insert(1, 1).await;
         cache.start_failsafe_cycle(1).await;
