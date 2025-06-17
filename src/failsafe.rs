@@ -130,6 +130,10 @@ impl<TKey: Hash + Eq + Send + Sync + Clone + 'static, TValue: Clone + Send + Syn
     pub fn soft_timeout(&self) -> Option<std::time::Duration> {
         self.configuration.soft_timeout
     }
+
+    pub async fn invalidate(&self, key: &TKey) {
+        self.cache.invalidate(key).await;
+    }
 }
 
 #[cfg(test)]
