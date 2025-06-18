@@ -1,5 +1,5 @@
 [package]
-name = "fusion-cache-rs"
+name = "fusioncache-rs"
 version = "0.1.0"
 edition = "2024"
 

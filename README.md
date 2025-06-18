@@ -266,6 +266,8 @@ To run the tests:
 cargo test
 ```
 
+NB: you need to have a local redis instance running on port 6379 for the tests to pass.
+
 The test suite includes comprehensive tests for:
 - Concurrent access
 - Fail-safe behavior
