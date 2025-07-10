@@ -29,6 +29,9 @@ A Rust port of https://github.com/ZiggyCreatures/FusionCache
   - Automatic cache invalidation across instances
   - Configurable background writes
   - Connection resilience and auto-recovery
+- ⚙️ **Per-Entry Options**: Fine-grained control over individual cache entries
+- 🕐 **Time-to-Idle Support**: Configurable idle time expiration
+- 📊 **Comprehensive Logging**: Built-in tracing support for debugging and monitoring
 
 ## Installation
 
@@ -49,7 +52,7 @@ Fusion Cache implements a sophisticated cache stampede protection mechanism. Whe
 
 ```rust
 // Example of how request coalescing works
-let mut cache = FusionCacheBuilder::new().build();
+let mut cache = FusionCacheBuilder::new().build().await.unwrap();
 
 // These concurrent requests will be coalesced
 let handles: Vec<_> = (0..1000).map(|_| {
@@ -57,7 +60,7 @@ let handles: Vec<_> = (0..1000).map(|_| {
     let factory = factory.clone();
     tokio::spawn(async move {
         // Only one factory call will be made, all requests get the same result
-        cache.get_or_set(key, factory).await
+        cache.get_or_set(key, factory, None).await
     })
 }).collect();
 ```
@@ -76,7 +79,7 @@ The request coalescing mechanism:
 ## Quick Start
 
 ```rust
-use fusion_cache::{FusionCacheBuilder, Factory};
+use fusion_cache::{FusionCacheBuilder, Factory, FusionCacheOptionsBuilder};
 use std::time::Duration;
 
 #[derive(Clone)]
@@ -94,6 +97,8 @@ impl Factory<String, String, Error> for MyDataFactory {
 async fn main() {
     let mut cache = FusionCacheBuilder::new()
         .with_capacity(1000)
+        .with_time_to_live(Duration::from_secs(300))
+        .with_time_to_idle(Duration::from_secs(60))
         .with_fail_safe(
             Duration::from_secs(300),  // Entry TTL
             Duration::from_secs(60),   // Failsafe TTL
@@ -105,18 +110,40 @@ async fn main() {
             "redis://127.0.0.1/".to_string(),
             "my_app".to_string(),
             false, // Whether to perform Redis writes in background
+            Some(Duration::from_secs(300)), // Redis entry TTL
         )
         .build()
         .await
         .unwrap();
 
-    let value = cache.get_or_set("key".to_string(), MyDataFactory)
+    let value = cache.get_or_set("key".to_string(), MyDataFactory, None)
         .await
         .unwrap();
 }
 ```
 
 ## Advanced Usage
+
+### Per-Entry Options
+
+You can override cache settings for individual entries using `FusionCacheOptionsBuilder`:
+
+```rust
+use fusion_cache::FusionCacheOptionsBuilder;
+
+// Create per-entry options
+let options = FusionCacheOptionsBuilder::new()
+    .with_time_to_live(Duration::from_secs(60))
+    .with_time_to_idle(Duration::from_secs(30))
+    .skip_distributed_cache() // Skip Redis for this entry
+    .build();
+
+// Use options for specific entry
+let value = cache.get_or_set("key".to_string(), factory, Some(options)).await?;
+
+// Set value directly with options
+cache.set("key".to_string(), "value".to_string(), Some(options)).await;
+```
 
 ### Distributed Cache Configuration
 
@@ -128,6 +155,7 @@ let cache = FusionCacheBuilder::new()
         "redis://127.0.0.1/".to_string(),
         "my_app".to_string(),
         true, // Enable background writes for better performance
+        Some(Duration::from_secs(300)), // Redis entry TTL
     )
     .build()
     .await
@@ -139,6 +167,7 @@ The distributed cache provides:
 - Cache invalidation through Redis pub/sub
 - Connection resilience with automatic recovery
 - Optional background writes for better performance
+- Configurable TTL for Redis entries
 
 ### Fail-Safe Configuration
 
@@ -191,7 +220,7 @@ The cache provides detailed error types:
 pub enum FusionCacheError {
     Other,
     SystemCorruption,
-    FactoryError,
+    FactoryError(String),
     FactoryTimeout,
     InitializationError(String),
     RedisError(String),
@@ -206,6 +235,8 @@ pub enum FusionCacheError {
 - Thread-safe for high-concurrency environments
 - Optional background Redis writes for better performance
 - Efficient distributed cache synchronization
+- Per-entry option overrides for fine-grained control
+- Time-to-idle expiration for better cache efficiency
 
 ## Examples
 
@@ -216,7 +247,7 @@ let cache = FusionCacheBuilder::new()
     .build()
     .await
     .unwrap();
-let value = cache.get_or_set(key, factory).await?;
+let value = cache.get_or_set(key, factory, None).await?;
 ```
 
 ### With Distributed Cache
@@ -227,6 +258,7 @@ let cache = FusionCacheBuilder::new()
         "redis://127.0.0.1/".to_string(),
         "my_app".to_string(),
         true,
+        Some(Duration::from_secs(300)),
     )
     .build()
     .await
@@ -248,6 +280,25 @@ let cache = FusionCacheBuilder::new()
     .build()
     .await
     .unwrap();
+```
+
+### With Per-Entry Options
+
+```rust
+// Create cache with default settings
+let mut cache = FusionCacheBuilder::new()
+    .with_time_to_live(Duration::from_secs(300))
+    .build()
+    .await
+    .unwrap();
+
+// Override settings for specific entry
+let options = FusionCacheOptionsBuilder::new()
+    .with_time_to_live(Duration::from_secs(60))
+    .skip_distributed_cache()
+    .build();
+
+let value = cache.get_or_set("key", factory, Some(options)).await?;
 ```
 
 ## Contributing
@@ -276,3 +327,6 @@ The test suite includes comprehensive tests for:
 - Error handling
 - Distributed cache functionality
 - Redis connection resilience
+- Per-entry options and overrides
+- Time-to-idle expiration
+- Cache stampede protection

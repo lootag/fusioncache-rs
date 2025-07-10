@@ -1,9 +1,10 @@
-use std::{env, marker::PhantomData, sync::Arc};
+use std::{env, marker::PhantomData, sync::Arc, time::Duration};
 
 use chrono::Utc;
 use futures::StreamExt;
-use redis::{AsyncCommands, Client, RedisError, aio::MultiplexedConnection};
+use redis::{AsyncCommands, Client, RedisError, SetExpiry, SetOptions, aio::MultiplexedConnection};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use std::fmt::Debug;
 use tokio::{
     sync::{Mutex, mpsc},
     task::JoinHandle,
@@ -12,8 +13,9 @@ use tokio_retry::{
     Retry,
     strategy::{FibonacciBackoff, jitter},
 };
+use tracing::{debug, error, info};
 
-use crate::FusionCacheError;
+use crate::{CacheValue, FusionCacheError, LOG_TARGET};
 
 impl From<RedisError> for FusionCacheError {
     fn from(error: RedisError) -> Self {
@@ -24,7 +26,34 @@ impl From<RedisError> for FusionCacheError {
 #[derive(Serialize, Deserialize)]
 pub struct DistributedCacheValue<TValue> {
     value: TValue,
+    entry_ttl: Option<i64>,
+    entry_tti: Option<i64>,
     last_write: i64,
+}
+
+impl<TValue: Clone + Send + Sync + Serialize + DeserializeOwned + 'static> From<CacheValue<TValue>>
+    for DistributedCacheValue<TValue>
+{
+    fn from(value: CacheValue<TValue>) -> Self {
+        DistributedCacheValue {
+            value: value.value,
+            entry_ttl: value.time_to_live.map(|d| d.as_secs() as i64),
+            entry_tti: value.time_to_idle.map(|d| d.as_secs() as i64),
+            last_write: Utc::now().timestamp_millis(),
+        }
+    }
+}
+
+impl<TValue: Clone + Send + Sync + Serialize + DeserializeOwned + 'static>
+    From<DistributedCacheValue<TValue>> for CacheValue<TValue>
+{
+    fn from(value: DistributedCacheValue<TValue>) -> Self {
+        CacheValue {
+            value: value.value,
+            time_to_live: value.entry_ttl.map(|d| Duration::from_secs(d as u64)),
+            time_to_idle: value.entry_tti.map(|d| Duration::from_secs(d as u64)),
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -33,7 +62,7 @@ pub struct CacheSynchronizationPayload {
     key: String,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct RedisConnection {
     redis_connection: MultiplexedConnection,
     should_fail: bool,
@@ -71,6 +100,7 @@ impl RedisConnection {
         key: &str,
         value: &str,
         application_name: &str,
+        entry_ttl: Option<Duration>,
     ) -> Result<(), FusionCacheError> {
         if self.should_fail {
             return Err(FusionCacheError::RedisError(
@@ -78,8 +108,12 @@ impl RedisConnection {
             ));
         }
         let namespaced_key = format!("{}:{}", application_name, key);
+        let mut set_options = SetOptions::default();
+        if let Some(entry_ttl) = entry_ttl {
+            set_options = set_options.with_expiration(SetExpiry::EX(entry_ttl.as_secs()));
+        }
         self.redis_connection
-            .set(&namespaced_key, value)
+            .set_options(&namespaced_key, value, set_options)
             .await
             .map_err(FusionCacheError::from)
     }
@@ -107,7 +141,7 @@ impl RedisConnection {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct DistributedCache<
     TKey: Eq + Send + Sync + Clone + Serialize + DeserializeOwned + 'static,
     TValue: Clone + Send + Sync + Serialize + DeserializeOwned + 'static,
@@ -121,12 +155,13 @@ pub struct DistributedCache<
     _tkey: PhantomData<TKey>,
     _tvalue: PhantomData<TValue>,
     redis_connection: RedisConnection,
+    entry_ttl: Option<Duration>,
     node_id: String,
 }
 
 impl<
-    TKey: Eq + Send + Sync + Clone + Serialize + DeserializeOwned + 'static,
-    TValue: Clone + Send + Sync + Serialize + DeserializeOwned + 'static,
+    TKey: Eq + Send + Sync + Clone + Serialize + DeserializeOwned + Debug + 'static,
+    TValue: Clone + Send + Sync + Serialize + DeserializeOwned + Debug + 'static,
 > DistributedCache<TKey, TValue>
 {
     pub fn new(
@@ -134,6 +169,7 @@ impl<
         redis_client: Client,
         eviction_event_sender: mpsc::Sender<TKey>,
         application_name: String,
+        entry_ttl: Option<Duration>,
     ) -> Self {
         let node_id = if env::var("KUBERNETES_SERVICE_HOST").is_ok() {
             env::var("HOSTNAME").unwrap()
@@ -189,6 +225,7 @@ impl<
             node_id,
             _tkey: PhantomData,
             _tvalue: PhantomData,
+            entry_ttl,
         }
     }
 
@@ -211,7 +248,11 @@ impl<
         Ok(())
     }
 
-    pub async fn get(&mut self, key: &TKey) -> Result<Option<TValue>, FusionCacheError> {
+    #[tracing::instrument(name = "DistributedCache::get", skip(self))]
+    pub async fn get(
+        &mut self,
+        key: &TKey,
+    ) -> Result<Option<CacheValue<TValue>>, FusionCacheError> {
         let key_str = serde_json::to_string(key).unwrap();
         let value: Option<String> = self
             .redis_connection
@@ -223,16 +264,17 @@ impl<
             } else {
                 None
             };
-        Ok(distributed_cache_value.map(|v| v.value))
+        Ok(distributed_cache_value.map(|v| v.into()))
     }
 
-    pub async fn set(&mut self, key: &TKey, value: &TValue) -> Result<(), FusionCacheError> {
+    #[tracing::instrument(name = "DistributedCache::set", skip(self))]
+    pub async fn set(
+        &mut self,
+        key: &TKey,
+        value: &CacheValue<TValue>,
+    ) -> Result<(), FusionCacheError> {
         let key_str = serde_json::to_string(key).unwrap();
-        let value_str = serde_json::to_string(&DistributedCacheValue {
-            value: value.clone(),
-            last_write: Utc::now().timestamp_millis(),
-        })
-        .unwrap();
+        let value_str = serde_json::to_string(&DistributedCacheValue::from(value.clone())).unwrap();
 
         let cache_synchronization_payload = CacheSynchronizationPayload {
             node_id: self.node_id.clone(),
@@ -243,10 +285,11 @@ impl<
 
         match self
             .redis_connection
-            .set(&key_str, &value_str, &self.application_name)
+            .set(&key_str, &value_str, &self.application_name, self.entry_ttl)
             .await
         {
             Ok(_) => {
+                debug!(target: LOG_TARGET, "Successfully set value in distributed cache for key: {:?}. Publishing synchronization payload: {:?}", key, json_cache_synchronization_payload);
                 let publish_result = self
                     .redis_connection
                     .publish(
@@ -255,6 +298,7 @@ impl<
                     )
                     .await;
                 if let Err(e) = publish_result {
+                    error!(target: LOG_TARGET, "Failed to publish synchronization payload: {:?}. Kicking off auto-recovery for key: {:?}", e, key);
                     let failure_timestamp = Utc::now().timestamp_millis();
                     let key: TKey = serde_json::from_str(&key_str).unwrap();
                     self.auto_recovery_event_sender
@@ -277,6 +321,33 @@ impl<
                     .unwrap();
                 Err(e)
             }
+        }
+    }
+
+    pub async fn evict(&mut self, key: &TKey) {
+        let key_str = serde_json::to_string(key).unwrap();
+        let cache_synchronization_payload = CacheSynchronizationPayload {
+            node_id: self.node_id.clone(),
+            key: key_str.clone(),
+        };
+        let json_cache_synchronization_payload =
+            serde_json::to_string(&cache_synchronization_payload).unwrap();
+        let publish_result = self
+            .redis_connection
+            .publish(
+                self.application_name.as_str(),
+                &json_cache_synchronization_payload,
+            )
+            .await
+            .map_err(FusionCacheError::from);
+        if let Err(e) = publish_result {
+            error!(target: LOG_TARGET, "Failed to publish synchronization payload: {:?}. Kicking off auto-recovery for key: {:?}", e, key);
+            let failure_timestamp = Utc::now().timestamp_millis();
+            let key: TKey = serde_json::from_str(&key_str).unwrap();
+            self.auto_recovery_event_sender
+                .send((key, failure_timestamp))
+                .await
+                .unwrap();
         }
     }
 
@@ -308,16 +379,22 @@ mod tests {
             redis_client,
             eviction_sender,
             "test_app".to_string(),
+            None,
         );
 
         // Test setting and getting a value
         let key = "test_key".to_string();
         let value = "test_value".to_string();
+        let cache_value = CacheValue {
+            value: value.clone(),
+            time_to_live: None,
+            time_to_idle: None,
+        };
 
-        cache.set(&key, &value).await.unwrap();
+        cache.set(&key, &cache_value).await.unwrap();
         let retrieved_value = cache.get(&key).await.unwrap();
 
-        assert_eq!(retrieved_value, Some(value));
+        assert_eq!(retrieved_value, Some(cache_value));
     }
 
     #[tokio::test]
@@ -336,6 +413,7 @@ mod tests {
             redis_client1,
             eviction_sender1,
             "test_synchronization".to_string(),
+            None,
         );
 
         let redis_client2 = Client::open("redis://127.0.0.1/").unwrap();
@@ -351,6 +429,7 @@ mod tests {
             redis_client2,
             eviction_sender2,
             "test_synchronization".to_string(),
+            None,
         );
 
         // Start synchronization for both caches
@@ -360,7 +439,12 @@ mod tests {
         // Set a value in cache1
         let key = "sync_test_key".to_string();
         let value = "sync_test_value".to_string();
-        cache1.set(&key, &value).await.unwrap();
+        let cache_value = CacheValue {
+            value: value.clone(),
+            time_to_live: None,
+            time_to_idle: None,
+        };
+        cache1.set(&key, &cache_value).await.unwrap();
 
         // Wait for synchronization
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -385,20 +469,30 @@ mod tests {
             redis_client,
             eviction_sender,
             "test_concurrent_writes".to_string(),
+            None,
         );
 
         let key = "concurrent_key".to_string();
         let value1 = "value1".to_string();
+        let cache_value1 = CacheValue {
+            value: value1.clone(),
+            time_to_live: None,
+            time_to_idle: None,
+        };
         let value2 = "value2".to_string();
-
+        let cache_value2 = CacheValue {
+            value: value2.clone(),
+            time_to_live: None,
+            time_to_idle: None,
+        };
         // First write should succeed
-        assert!(cache.set(&key, &value1).await.is_ok());
+        assert!(cache.set(&key, &cache_value1).await.is_ok());
 
-        assert!(cache.set(&key, &value2).await.is_ok());
+        assert!(cache.set(&key, &cache_value2).await.is_ok());
 
         // Verify the value was updated
         let retrieved_value = cache.get(&key).await.unwrap();
-        assert_eq!(retrieved_value, Some(value2));
+        assert_eq!(retrieved_value, Some(cache_value2));
     }
 
     #[tokio::test]
@@ -418,18 +512,29 @@ mod tests {
             redis_client,
             eviction_sender,
             "test_auto_recovery".to_string(),
+            None,
         );
 
         let key = "key".to_string();
         let value = "value".to_string();
+        let cache_value = CacheValue {
+            value: value.clone(),
+            time_to_live: None,
+            time_to_idle: None,
+        };
 
         // Set initial value
-        cache.set(&key, &value).await.unwrap();
+        cache.set(&key, &cache_value).await.unwrap();
 
         cache.break_connection();
 
         let value2 = "value2".to_string();
-        let set_result = cache.set(&key, &value2).await;
+        let cache_value2 = CacheValue {
+            value: value2.clone(),
+            time_to_live: None,
+            time_to_idle: None,
+        };
+        let set_result = cache.set(&key, &cache_value2).await;
         assert!(set_result.is_err());
 
         tokio::time::sleep(Duration::from_secs(2)).await;

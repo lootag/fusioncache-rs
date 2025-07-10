@@ -6,18 +6,18 @@ use tokio::sync::Mutex;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum FailSafeResult<TValue> {
     Hit(TValue),
-    Miss,
-    TooManyCycles,
+    Miss(String),
+    TooManyCycles(String),
     CurrentCycleEnded,
     NotInFailSafeMode,
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct FailSafeConfiguration {
-    entry_ttl: std::time::Duration,
-    failsafe_ttl: std::time::Duration,
-    max_cycles: Option<u64>,
-    soft_timeout: Option<std::time::Duration>,
+    pub(crate) entry_ttl: std::time::Duration,
+    pub(crate) failsafe_ttl: std::time::Duration,
+    pub(crate) max_cycles: Option<u64>,
+    pub(crate) soft_timeout: Option<std::time::Duration>,
 }
 
 impl FailSafeConfiguration {
@@ -41,10 +41,11 @@ pub(crate) struct FailSafeCache<
     TKey: Hash + Eq + Send + Sync + Clone + 'static,
     TValue: Clone + Send + Sync + 'static,
 > {
-    configuration: FailSafeConfiguration,
-    cycle_start: Arc<Mutex<HashMap<TKey, DateTime<Utc>>>>,
-    current_cycle: Arc<Mutex<HashMap<TKey, u64>>>,
-    cache: Cache<TKey, TValue>,
+    pub(crate) configuration: FailSafeConfiguration,
+    pub(crate) cycle_start: Arc<Mutex<HashMap<TKey, DateTime<Utc>>>>,
+    pub(crate) current_cycle: Arc<Mutex<HashMap<TKey, u64>>>,
+    pub(crate) errors: Arc<Mutex<HashMap<TKey, String>>>,
+    pub(crate) cache: Cache<TKey, TValue>,
 }
 
 impl<TKey: Hash + Eq + Send + Sync + Clone + 'static, TValue: Clone + Send + Sync + 'static>
@@ -58,6 +59,7 @@ impl<TKey: Hash + Eq + Send + Sync + Clone + 'static, TValue: Clone + Send + Syn
             configuration,
             cycle_start: Arc::new(Mutex::new(HashMap::new())),
             current_cycle: Arc::new(Mutex::new(HashMap::new())),
+            errors: Arc::new(Mutex::new(HashMap::new())),
             cache,
         }
     }
@@ -66,7 +68,7 @@ impl<TKey: Hash + Eq + Send + Sync + Clone + 'static, TValue: Clone + Send + Syn
 impl<TKey: Hash + Eq + Send + Sync + Clone + 'static, TValue: Clone + Send + Sync + 'static>
     FailSafeCache<TKey, TValue>
 {
-    pub async fn start_failsafe_cycle(&mut self, key: TKey) {
+    pub async fn start_failsafe_cycle(&mut self, key: TKey, error: String) {
         let mut cycle_start = self.cycle_start.lock().await;
         let mut current_cycle = self.current_cycle.lock().await;
         cycle_start.insert(key.clone(), Utc::now());
@@ -74,6 +76,9 @@ impl<TKey: Hash + Eq + Send + Sync + Clone + 'static, TValue: Clone + Send + Syn
         if !current_cycle.contains_key(&key) {
             current_cycle.insert(key.clone(), 0);
         }
+        let mut errors = self.errors.lock().await;
+        errors.insert(key.clone(), error);
+        drop(errors);
         drop(current_cycle);
     }
 
@@ -99,7 +104,10 @@ impl<TKey: Hash + Eq + Send + Sync + Clone + 'static, TValue: Clone + Send + Syn
                 let current_cycle = current_cycle_map.get(key).unwrap();
                 if *current_cycle >= max_cycles {
                     drop(current_cycle_map);
-                    return FailSafeResult::TooManyCycles;
+                    let mut errors = self.errors.lock().await;
+                    let error = errors.get(key).unwrap().clone();
+                    drop(errors);
+                    return FailSafeResult::TooManyCycles(error);
                 } else {
                     let updated_current_cycle = *current_cycle + 1;
                     current_cycle_map.insert(key.clone(), updated_current_cycle);
@@ -107,7 +115,10 @@ impl<TKey: Hash + Eq + Send + Sync + Clone + 'static, TValue: Clone + Send + Syn
                     if let Some(entry) = self.cache.get(key).await {
                         return FailSafeResult::Hit(entry);
                     } else {
-                        return FailSafeResult::Miss;
+                        let errors = self.errors.lock().await;
+                        let error = errors.get(key).unwrap().clone();
+                        drop(errors);
+                        return FailSafeResult::Miss(error);
                     }
                 }
             } else {
@@ -115,7 +126,10 @@ impl<TKey: Hash + Eq + Send + Sync + Clone + 'static, TValue: Clone + Send + Syn
                 if let Some(entry) = self.cache.get(key).await {
                     return FailSafeResult::Hit(entry);
                 } else {
-                    return FailSafeResult::Miss;
+                    let errors = self.errors.lock().await;
+                    let error = errors.get(key).unwrap().clone();
+                    drop(errors);
+                    return FailSafeResult::Miss(error);
                 }
             }
         } else {
@@ -125,10 +139,6 @@ impl<TKey: Hash + Eq + Send + Sync + Clone + 'static, TValue: Clone + Send + Syn
 
     pub async fn insert(&self, key: TKey, value: TValue) {
         self.cache.insert(key, value).await;
-    }
-
-    pub fn soft_timeout(&self) -> Option<std::time::Duration> {
-        self.configuration.soft_timeout
     }
 
     pub async fn invalidate(&self, key: &TKey) {
@@ -162,7 +172,7 @@ mod tests {
             None,
         ));
         cache.insert(1, 1).await;
-        cache.start_failsafe_cycle(1).await;
+        cache.start_failsafe_cycle(1, "test".to_string()).await;
         tokio::time::sleep(std::time::Duration::from_secs(6)).await;
         let result = cache.get(&1).await;
         assert_eq!(result, FailSafeResult::CurrentCycleEnded);
@@ -177,7 +187,7 @@ mod tests {
             None,
         ));
         cache.insert(1, 1).await;
-        cache.start_failsafe_cycle(1).await;
+        cache.start_failsafe_cycle(1, "test".to_string()).await;
         let result = cache.get(&1).await;
         assert_eq!(result, FailSafeResult::Hit(1));
     }
@@ -192,9 +202,9 @@ mod tests {
         ));
         cache.insert(1, 1).await;
         tokio::time::sleep(std::time::Duration::from_secs(4)).await;
-        cache.start_failsafe_cycle(1).await;
+        cache.start_failsafe_cycle(1, "test".to_string()).await;
         let result = cache.get(&1).await;
-        assert_eq!(result, FailSafeResult::Miss);
+        assert_eq!(result, FailSafeResult::Miss("test".to_string()));
     }
 
     #[tokio::test]
@@ -207,20 +217,20 @@ mod tests {
             None,
         ));
         cache.insert(1, 1).await;
-        cache.start_failsafe_cycle(1).await;
+        cache.start_failsafe_cycle(1, "test".to_string()).await;
         assert_eq!(cache.get(&1).await, FailSafeResult::Hit(1));
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
         assert_eq!(cache.get(&1).await, FailSafeResult::CurrentCycleEnded);
-        cache.start_failsafe_cycle(1).await;
+        cache.start_failsafe_cycle(1, "test".to_string()).await;
         assert_eq!(cache.get(&1).await, FailSafeResult::Hit(1));
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
         assert_eq!(cache.get(&1).await, FailSafeResult::CurrentCycleEnded);
-        cache.start_failsafe_cycle(1).await;
+        cache.start_failsafe_cycle(1, "test".to_string()).await;
         assert_eq!(cache.get(&1).await, FailSafeResult::Hit(1));
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
         assert_eq!(cache.get(&1).await, FailSafeResult::CurrentCycleEnded);
-        cache.start_failsafe_cycle(1).await;
+        cache.start_failsafe_cycle(1, "test".to_string()).await;
         let result = cache.get(&1).await;
-        assert_eq!(result, FailSafeResult::TooManyCycles);
+        assert_eq!(result, FailSafeResult::TooManyCycles("test".to_string()));
     }
 }
