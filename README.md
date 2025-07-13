@@ -39,7 +39,7 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-fusioncache-rs = "0.1.1"
+fusioncache-rs = "0.1.2"
 ```
 
 ## Cache Stampede Protection
@@ -75,6 +75,8 @@ The request coalescing mechanism:
 - Reduces system load under high concurrency
 - Ensures consistent results across concurrent requests
 - Adds minimal overhead through efficient channel usage
+
+
 
 ## Quick Start
 
@@ -163,11 +165,15 @@ let cache = FusionCacheBuilder::new()
 ```
 
 The distributed cache provides:
-- Automatic synchronization across multiple instances
-- Cache invalidation through Redis pub/sub
-- Connection resilience with automatic recovery
-- Optional background writes for better performance
-- Configurable TTL for Redis entries
+- **Automatic synchronization across multiple instances**: When you have multiple application instances running, the distributed cache ensures that cache entries are automatically shared and synchronized between all instances. When one instance updates a cache entry, all other instances receive the update through Redis, maintaining consistency across your entire application cluster. This eliminates the need for manual cache coordination and ensures that all users see the same data regardless of which instance serves their request.
+
+- **Cache invalidation through Redis pub/sub**: The distributed cache uses Redis's publish/subscribe mechanism to broadcast cache invalidation events across all connected instances. When an entry is invalidated on one instance, a message is published to a Redis channel that all other instances subscribe to, allowing them to immediately remove the corresponding entry from their local cache. This ensures that cache invalidation is propagated instantly across your entire application cluster, preventing stale data from being served. Additionally, when new values are set in the cache, existing entries with the same key are automatically invalidated across all instances to ensure data consistency.
+
+- **Connection resilience with automatic recovery**: The distributed cache is designed to handle Redis connection failures gracefully. If the connection to Redis is lost, the cache continues to function using only the local cache while attempting to reconnect in the background. Once the connection is restored, the cache automatically resumes distributed operations without requiring application restart. This resilience ensures your application remains functional even during Redis outages or network issues.
+
+- **Optional background writes for better performance**: You can configure the distributed cache to perform Redis writes asynchronously in the background, allowing your application to continue processing requests immediately without waiting for Redis operations to complete. This significantly improves response times for write operations while still maintaining eventual consistency. Background writes are particularly beneficial for high-throughput applications where Redis latency could become a bottleneck.
+
+- **Configurable TTL for Redis entries**: Each cache entry in Redis can have its own time-to-live (TTL) setting, allowing you to control how long data persists in the distributed cache independently of the local cache TTL. This flexibility enables you to optimize Redis storage usage by setting shorter TTLs for frequently changing data while keeping stable data in Redis longer. You can also set different TTLs for different types of data based on their update frequency and importance.
 
 ### Fail-Safe Configuration
 
@@ -187,6 +193,16 @@ let cache = FusionCacheBuilder::new()
 ```
 
 ### Timeout Behaviors
+
+fusioncache-rs provides sophisticated timeout handling to ensure your application remains responsive even when data sources are slow or unresponsive. The cache implements multiple layers of timeout protection that work together to provide graceful degradation and optimal user experience.
+
+**Soft Timeouts** are the first line of defense against slow operations. When a factory operation takes longer than the configured soft timeout, the cache immediately returns a cached value from the fail-safe cache (if available) while allowing the original operation to continue in the background (if background execution is enabled). This ensures users get a response quickly, even if it's slightly stale data. The soft timeout is particularly useful for operations that are expensive but not critical for real-time accuracy.
+
+**Hard Timeouts** provide an absolute upper bound on how long the cache will wait for a factory operation to complete. Once this timeout is reached, the operation is forcefully terminated and the cache returns an error. This prevents your application from hanging indefinitely when external services are completely unresponsive. Hard timeouts are essential for maintaining system responsiveness and preventing resource exhaustion.
+
+**Background Execution** can be enabled to allow factory operations to continue running even after a soft timeout has occurred. When enabled, the cache will return the vailue from the fail-safe cache immediately (if available), but the factory operation continues executing in the background. If the background operation completes successfully, the result is cached for future requests. This feature is particularly valuable for operations that are expensive to compute but where you want to avoid repeated failures.
+
+The timeout system works in harmony with the fail-safe mechanism: when a soft timeout triggers, the cache falls back to fail-safe data; when a hard timeout triggers, the cache will return an error. This multi-layered approach ensures that your application can gracefully handle various failure scenarios while maintaining optimal performance.
 
 Control how the cache handles slow operations:
 
