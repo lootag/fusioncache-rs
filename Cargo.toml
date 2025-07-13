@@ -1,6 +1,6 @@
 [package]
 name = "fusioncache-rs"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "A multilevel cache for Rust. Inspired by https://github.com/ZiggyCreatures/FusionCache"
 license = "MIT"

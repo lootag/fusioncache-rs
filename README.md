@@ -39,7 +39,7 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-fusion-cache = "0.1.0"
+fusioncache-rs = "0.1.1"
 ```
 
 ## Cache Stampede Protection
@@ -220,7 +220,7 @@ The cache provides detailed error types:
 pub enum FusionCacheError {
     Other,
     SystemCorruption,
-    FactoryError(String),
+    FactoryError,
     FactoryTimeout,
     InitializationError(String),
     RedisError(String),
