@@ -39,7 +39,7 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-fusioncache-rs = "0.1.2"
+fusioncache-rs = "0.1.4"
 ```
 
 ## Cache Stampede Protection
